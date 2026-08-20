@@ -47,6 +47,7 @@ Example, 4-rank EGTP group on one node with NVLink off::
 """
 
 import argparse
+import inspect
 import os
 import statistics
 from collections import Counter
@@ -57,9 +58,14 @@ import torch
 try:
     from emerging_optimizers.orthogonalized_optimizers.muon_utils import newton_schulz_tp
 
+    # use_syrk (batched-SYRK Triton kernel path) only exists on emerging_optimizers builds
+    # that include it; older installs would TypeError on an unexpected kwarg.
+    HAVE_USE_SYRK = "use_syrk" in inspect.signature(newton_schulz_tp).parameters
+
     HAVE_EMERGING_OPTIMIZERS = True
 except ImportError:
     HAVE_EMERGING_OPTIMIZERS = False
+    HAVE_USE_SYRK = False
 
 # --------------------------------------------------------------------------------------
 # Nemotron-4 (152-layer hybrid Mamba-MoE), matching the training recipe.
@@ -198,7 +204,7 @@ def flop_model(matrix, mode: str, steps: int, group_size: int) -> Tuple[float, f
 
 
 def time_strategy(
-    local_shard, group, mode, steps, coefficient_type, iters, warmup, shard_count
+    local_shard, group, mode, steps, coefficient_type, iters, warmup, shard_count, use_syrk=False
 ) -> float:
     """Return the median wall-clock milliseconds of one orthogonalization.
 
@@ -206,6 +212,11 @@ def time_strategy(
     nothing to gather and every mode collapses to a local Newton-Schulz. Passing
     partition_dim=0 for one would all-gather ``group_size`` identical copies and
     orthogonalize a matrix that does not exist in the model.
+
+    ``use_syrk`` forwards to ``newton_schulz_tp``'s Triton SYRK kernel path (requires
+    emerging_optimizers with batched-SYRK support); it only takes effect at
+    fp32_matmul_precision="medium" and falls back to GEMM when a matrix dimension isn't
+    a multiple of 8.
     """
     # blockwise passes partition_dim=None, which is newton_schulz_tp's non-TP fallback:
     # Newton-Schulz on the local block with no collective.
@@ -220,6 +231,7 @@ def time_strategy(
             tp_group=group,
             partition_dim=partition_dim,
             tp_mode=tp_mode,
+            use_syrk=use_syrk,
         )
 
     for _ in range(warmup):
@@ -278,9 +290,19 @@ def main() -> None:
         choices=["medium", "high", "highest"],
         help="medium=bf16 compute (Megatron default), high=tf32, highest=true fp32.",
     )
+    parser.add_argument(
+        "--use-syrk",
+        action="store_true",
+        help="Route Newton-Schulz through the Triton batched-SYRK kernel instead of GEMMs. "
+        "Requires an emerging_optimizers install with batched-SYRK support (e.g. PR #276).",
+    )
     config = parser.parse_args()
 
     assert HAVE_EMERGING_OPTIMIZERS, "emerging_optimizers is required; pip install it first."
+    assert not config.use_syrk or HAVE_USE_SYRK, (
+        "--use-syrk requires an emerging_optimizers install whose newton_schulz_tp accepts "
+        "use_syrk (e.g. checkout PR #276); this install's signature does not."
+    )
 
     torch.set_float32_matmul_precision(config.fp32_matmul_prec)
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
@@ -317,7 +339,7 @@ def main() -> None:
     log(f"{len(profiles)} distinct rank profiles over {len(distinct)} distinct shapes")
     log(
         f"ns_steps={config.num_ns_steps} coefficient={config.coefficient_type} "
-        f"dtype={config.dtype} iters={config.iters}"
+        f"dtype={config.dtype} iters={config.iters} use_syrk={config.use_syrk}"
     )
     log(
         f"fp32_matmul_precision={torch.get_float32_matmul_precision()} "
@@ -355,6 +377,7 @@ def main() -> None:
                     config.iters,
                     config.warmup,
                     shard_count,
+                    use_syrk=config.use_syrk,
                 )
                 timings[mode] = ms
                 log(
