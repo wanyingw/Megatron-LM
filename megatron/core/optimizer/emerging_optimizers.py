@@ -352,6 +352,11 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         self._tp_mode_cache: Dict[tuple, str] = {}
         self._hw_profile = _hardware_profile() if tp_mode == "auto" else None
         self._warned_qkv_split_disabled = False
+        # Profiling switches, set only by megatron.training.muon_overlap_profiling: with
+        # profiling_skip_step the step allocates state but applies no update, and orders the
+        # current stream behind profiling_join_streams (the shadow-optimizer join point).
+        self.profiling_skip_step = False
+        self.profiling_join_streams: list = []
 
         weight_decay_method = "decoupled" if use_decoupled_weight_decay else "l2"
         # Use explicit class call instead of super() so that subclasses with
@@ -368,6 +373,29 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             fp32_matmul_prec=fp32_matmul_prec,
             scaled_orthogonalize_fn=scaled_orthogonalize_fn,
         )
+
+    @torch.no_grad()
+    def step(self, closure: Optional[Callable] = None) -> Optional[float]:
+        """Standard Muon step, or the profiling no-op when ``profiling_skip_step`` is set."""
+        if self.profiling_skip_step:
+            if closure is not None:
+                raise ValueError("closure is not supported")
+            self._profiling_skip_step()
+            return None
+        return super().step(closure)
+
+    def _profiling_skip_step(self) -> None:
+        """The --muon-overlap-skip-step body, shared with LayerShardedMuon.
+
+        Allocates the momentum state exactly like a real step would (so memory matches),
+        applies no update, and makes the current stream wait for every
+        ``profiling_join_streams`` entry: with a shadow optimizer running on those streams,
+        this is where the real step would have had to wait for its results.
+        """
+        for group in self.param_groups:
+            self._init_group(group)
+        for stream in self.profiling_join_streams:
+            torch.cuda.current_stream().wait_stream(stream)
 
     @staticmethod
     def _all_gather_tensor(t, group, dim):

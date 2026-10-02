@@ -1855,6 +1855,30 @@ def validate_args(args, defaults={}):
                 "Newton-Schulz yet; pass --muon-no-split-qkv."
             )
 
+    # Backward <-> Muon overlap profiling switches (megatron/training/muon_overlap_profiling.py).
+    muon_overlap_shadow = getattr(args, 'muon_overlap_shadow', None)
+    if muon_overlap_shadow is not None:
+        assert re.fullmatch(r"tail|bucket:[1-9]\d*", muon_overlap_shadow), (
+            "--muon-overlap-shadow must be 'tail' or 'bucket:K' with K >= 1, "
+            f"got {muon_overlap_shadow!r}"
+        )
+        assert args.muon_overlap_skip_step, (
+            "--muon-overlap-shadow requires --muon-overlap-skip-step: the shadow replaces the "
+            "real Muon step, it does not run next to it."
+        )
+        assert 'layer_sharded' in (muon_dense_mode, muon_expert_mode), (
+            "--muon-overlap-shadow clones LayerShardedMuon; it needs --muon-tp-mode "
+            "layer_sharded (or --muon-expert-tp-mode layer_sharded)."
+        )
+    if getattr(args, 'muon_overlap_skip_step', False):
+        assert args.optimizer == 'muon', (
+            "--muon-overlap-skip-step is a Muon profiling switch; use it with --optimizer muon."
+        )
+        warn_rank_0(
+            "--muon-overlap-skip-step is set: the Muon optimizer step is a NO-OP. This run "
+            "measures time only and does not train."
+        )
+
     assert not (
         args.use_layer_wise_distributed_optimizer and args.moe_single_grouped_weight
     ), (
@@ -2862,6 +2886,37 @@ def _add_regularization_args(parser):
                        'when the concurrent transient buffers push peak memory too high.')
     group.add_argument('--muon-extra-scale-factor', type=float, default=1.0,
                        help='Additional scale factor for the muon update')
+    # Backward <-> Muon overlap profiling (megatron/training/muon_overlap_profiling.py).
+    group.add_argument('--muon-overlap-probe', action='store_true',
+                       help='Profiling: log CUDA-event timing of every DDP bucket group\'s grad '
+                       'reduce-scatter completion relative to the end of backward compute, the '
+                       'end of finalize_model_grads, the global grad norm and the end of '
+                       'optimizer.step(), as world-wide min/median/max. For the backward <-> '
+                       'Muon overlap study; does not change numerics.')
+    group.add_argument('--muon-overlap-probe-interval', type=int, default=None,
+                       help='Log the --muon-overlap-probe telemetry every N iterations '
+                       '(default: --log-interval). Each log point synchronizes the device and '
+                       'runs one small all_gather.')
+    group.add_argument('--muon-overlap-skip-step', action='store_true',
+                       help='Profiling ONLY: make the Muon optimizer step a no-op (its state is '
+                       'still allocated) to measure the iteration time without any Muon work, '
+                       'the floor any overlap design can reach. The model does not train.')
+    group.add_argument('--muon-overlap-shadow', type=str, default=None,
+                       help='Profiling ONLY: run a shadow copy of every LayerShardedMuon '
+                       '(cloned params, random grads, same NS homes) on a side stream, launched '
+                       'at "tail" (when backward compute has been enqueued) or "bucket:K" (when '
+                       'the K-th Muon-managed bucket group dispatches its grad reduce-scatter, '
+                       '1-based), and joined where the real Muon step would run. Requires '
+                       '--muon-overlap-skip-step and --muon-tp-mode layer_sharded.')
+    group.add_argument('--muon-overlap-shadow-comm', type=str, default='dedicated',
+                       choices=['shared', 'dedicated'],
+                       help='Communicators for the shadow\'s all_to_alls: the model\'s own '
+                       'gtp_remat/tp groups (NCCL serializes them behind the backward\'s GTP '
+                       'collectives on the same communicator) or dedicated clones with the same '
+                       'ranks (concurrent). Default: dedicated.')
+    group.add_argument('--muon-overlap-shadow-max-ctas', type=int, default=None,
+                       help='NCCL max_ctas for the dedicated shadow communicators '
+                       '(--muon-overlap-shadow-comm dedicated); None keeps the NCCL default.')
     group.add_argument('--muon-scalar-optimizer', type=str, default='adam',
                        choices=['adam', 'lion'],
                        help='Optimizer for scalar parameters (embeddings, biases, norms) '

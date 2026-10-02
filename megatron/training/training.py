@@ -163,6 +163,10 @@ from megatron.training.initialize import (
     write_args_to_tensorboard,
 )
 from megatron.training.kernel_warmup import warmup_training_kernels
+from megatron.training.muon_overlap_profiling import (
+    get_muon_overlap_profiler,
+    setup_muon_overlap_profiling,
+)
 
 # Retain the training.py import path used by existing multimodal callers.
 from megatron.training.logging.packed_sequence_stats import (
@@ -3318,6 +3322,9 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             # If saving main_grads in this iteration, then all-reduce instead of reduce-scatter.
             model_chunk.force_all_reduce = save_wgrads_in_this_iteration
         optimizer.zero_grad()
+        overlap_profiler = get_muon_overlap_profiler()
+        if overlap_profiler is not None:
+            overlap_profiler.mark_iter_start()
 
         if has_nvidia_modelopt and getattr(args, "modelopt_enabled", False):
             # Distillation shape-adjust reads parallel_state; only for modelopt-enabled runs.
@@ -3472,6 +3479,9 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     )
     with _opt_cm as _opt_span:
         update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+        overlap_profiler = get_muon_overlap_profiler()
+        if overlap_profiler is not None:
+            overlap_profiler.mark_step_end()
         if _opt_span is not None:
             _otel_set_attrs(_opt_span, {
                 "megatron.update_successful": bool(update_successful),
@@ -4812,6 +4822,9 @@ def train(
     # Preserve a builder-installed finalize hook; only default it when unset.
     if config.finalize_model_grads_func is None:
         config.finalize_model_grads_func = finalize_model_grads
+    # Backward <-> Muon overlap profiling (--muon-overlap-*): wraps the finalize hook above and
+    # observes the DDP bucket groups; returns None and changes nothing when the flags are off.
+    setup_muon_overlap_profiling(args, model, optimizer, config)
 
     if args.log_energy:
         energy_monitor.setup()
@@ -5392,6 +5405,9 @@ def train(
                     callback_manager=callback_manager,
                     packed_sequence_stats=packed_sequence_stats,
                 )
+            overlap_profiler = get_muon_overlap_profiler()
+            if overlap_profiler is not None:
+                overlap_profiler.maybe_log(iteration)
             # OTel: close the iteration-report super-span (parents params_norm + log;
             # its own uninstrumented time is the loss_scale sync + FLOPs bookkeeping).
         finally:

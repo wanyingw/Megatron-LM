@@ -1527,6 +1527,9 @@ class ChainedOptimizer(MegatronOptimizer):
         else:
             self.is_stub_optimizer = True
         self.chained_optimizers = chained_optimizers
+        # Observers called with the global grad norm in step(), right after it is computed and
+        # before clipping (profiling hooks; see megatron.training.muon_overlap_profiling).
+        self.post_grad_norm_callbacks = []
 
     @property
     def optimizer(self):
@@ -1973,6 +1976,8 @@ class ChainedOptimizer(MegatronOptimizer):
             return False, None, None
 
         grad_norm = self.get_grad_norm()
+        for callback in getattr(self, 'post_grad_norm_callbacks', ()):
+            callback(grad_norm)
         should_skip_update = False
 
         should_clip = any(

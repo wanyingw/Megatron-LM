@@ -472,6 +472,30 @@ class LayerShardedMuon(TensorParallelMuon):
         # grad on some step safely trigger a rebuild. Metadata only, never buffers:
         # persistent exchange buffers would raise steady-state memory between steps.
         self._plans: dict[int, _GroupExchangePlan] = {}
+        # Constructor arguments minus ``params``: lets profiling tooling build a *shadow* copy of
+        # this optimizer with identical configuration (megatron.training.muon_overlap_profiling).
+        self._init_kwargs: dict[str, Any] = dict(
+            lr=lr,
+            momentum=momentum,
+            weight_decay=weight_decay,
+            nesterov=nesterov,
+            fp32_matmul_prec=fp32_matmul_prec,
+            coefficient_type=coefficient_type,
+            num_ns_steps=num_ns_steps,
+            scale_mode=scale_mode,
+            extra_scale_factor=extra_scale_factor,
+            gtp_remat_group=gtp_remat_group,
+            tp_group=tp_group,
+            ns_batch_size=ns_batch_size,
+            use_syrk=use_syrk,
+            concurrent_groups=concurrent_groups,
+            use_decoupled_weight_decay=use_decoupled_weight_decay,
+            split_qkv=split_qkv,
+            is_qkv_fn=is_qkv_fn,
+            qkv_split_shapes=qkv_split_shapes,
+            pg_collection=pg_collection,
+            tp_mode=tp_mode,
+        )
 
     def set_param_ns_homes(self, param_ns_homes: dict[int, tuple[int, int]]) -> None:
         """Set the NS home for each param (by id).
@@ -607,6 +631,11 @@ class LayerShardedMuon(TensorParallelMuon):
         class docstring for the per-stage breakdown)."""
         if closure is not None:
             raise ValueError("closure is not supported")
+
+        if self.profiling_skip_step:
+            # --muon-overlap-skip-step: no update; see TensorParallelMuon._profiling_skip_step.
+            self._profiling_skip_step()
+            return None
 
         # Fall back to TensorParallelMuon until homes are set: all-gather + TP-aware
         # full-matrix Newton-Schulz per param (with the groups from pg_collection).

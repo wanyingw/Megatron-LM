@@ -320,6 +320,13 @@ class _ParamAndGradBucketGroup:
         # bucket group early-drain its predecessor without the end-of-step finalize loop
         # double-waiting. Reset by `reset()`.
         self.grad_reduce_finished = False
+        # Observers of this bucket group's grad-reduce dispatch. Each is called with the bucket
+        # group at the end of start_grad_sync(), once the (possibly async) collective has been
+        # issued and grad_reduce_handle is set. start_grad_sync only runs once the bucket's grads
+        # are complete (last microbatch), so a callback that orders a CUDA stream behind
+        # grad_reduce_handle sees final, reduced gradients as early as they exist. Callbacks run
+        # inside backward hooks and must only enqueue GPU work (no host synchronization).
+        self.grad_sync_started_callbacks = []
 
         # Each time a local shard is created from bucket.param_data or bucket.grad_data, it
         # introduces some CPU overheads. We use these two lists to cache the created local
@@ -831,6 +838,9 @@ class _ParamAndGradBucketGroup:
             # maintain consistency with prior code, we need to manually set communication handle to
             # None.
             self.grad_reduce_handle = None
+
+        for callback in self.grad_sync_started_callbacks:
+            callback(self)
 
     def finish_grad_sync(self, force_all_reduce: Optional[bool] = False):
         """
