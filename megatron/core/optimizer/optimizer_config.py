@@ -332,6 +332,21 @@ class OptimizerConfig:
     all groups are live at once — disable (or lower muon_ns_batch_size) if peak memory is
     tight. Only used when muon_tp_mode='layer_sharded'. Defaults to True."""
 
+    muon_speculative_clip: bool = False
+    """Speculative gradient clipping for layer-sharded Muon. The Muon pipeline (momentum,
+    exchange, Newton-Schulz, reverse exchange) is launched on side streams as soon as the
+    gradients are final, before the global grad norm is known, assuming the clip will not
+    bind; the results are staged. Once the norm is known they are committed (bit-identical to
+    the normal step, since an unbound clip leaves the gradients untouched) or, if the clip
+    binds / the norm is non-finite / the update is skipped, dropped and recomputed on the
+    clipped gradients. Speculation starts only after muon_speculative_clip_warmup_steps
+    consecutive non-binding iterations. Requires muon_tp_mode='layer_sharded' (or
+    muon_expert_tp_mode='layer_sharded') and decoupled weight decay. Defaults to False."""
+
+    muon_speculative_clip_warmup_steps: int = 10
+    """Consecutive non-binding iterations required before speculating (any bind resets the
+    count). Measured bind rates are ~70% in the first ~10 iterations and ~0 afterwards."""
+
     muon_scalar_optimizer: str = 'adam'
     """Optimizer for nonlinear parameters (embeddings, biases, norms) when using muon.
     One of 'adam' or 'lion'. Defaults to 'adam'."""
@@ -501,6 +516,28 @@ class OptimizerConfig:
                 "muon_tp_mode='layer_sharded' does not implement split-QKV Newton-Schulz; "
                 "set muon_split_qkv=False."
             )
+        if self.muon_speculative_clip:
+            if 'layer_sharded' not in (self.muon_tp_mode, muon_expert_tp_mode):
+                raise ValueError(
+                    "muon_speculative_clip requires muon_tp_mode='layer_sharded' (or "
+                    "muon_expert_tp_mode='layer_sharded'): only LayerShardedMuon implements "
+                    "the speculative pass."
+                )
+            if not getattr(
+                self,
+                'muon_use_decoupled_weight_decay',
+                getattr(self, 'use_decoupled_weight_decay', True),
+            ):
+                raise ValueError(
+                    "muon_speculative_clip requires decoupled weight decay: l2 weight decay "
+                    "modifies the gradient inside the step, which the speculative pass does "
+                    "not replay."
+                )
+            if self.muon_speculative_clip_warmup_steps < 1:
+                raise ValueError(
+                    "muon_speculative_clip_warmup_steps must be >= 1, got "
+                    f"{self.muon_speculative_clip_warmup_steps}"
+                )
 
         if self.use_precision_aware_optimizer:
             assert (

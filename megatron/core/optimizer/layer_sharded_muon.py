@@ -279,6 +279,25 @@ class _GroupExchangePlan:
     route_plans: dict = dataclasses.field(default_factory=dict)
 
 
+@dataclasses.dataclass
+class _StagedGroup:
+    """One param group's speculative results, waiting for the clip verdict."""
+
+    params: list  # the group's grad-bearing params, in step order
+    plan: _GroupExchangePlan
+    replicated_ns_outputs: dict  # index into params -> scaled NS output (REPLICATED params)
+    update_shards: list  # aligned with plan.routed; None where this rank holds no shard
+
+
+@dataclasses.dataclass
+class _Speculation:
+    """Everything one speculative pass staged, plus the GPU event marking its completion."""
+
+    groups: dict  # group_index -> _StagedGroup
+    done: Any  # torch.cuda.Event, or None without CUDA
+    verdict: bool | None = None  # None: not verified yet; True: commit; False: discard
+
+
 class LayerShardedMuon(TensorParallelMuon):
     """Muon with layer sharding over the GTP_remat x TP domain.
 
@@ -496,6 +515,10 @@ class LayerShardedMuon(TensorParallelMuon):
             pg_collection=pg_collection,
             tp_mode=tp_mode,
         )
+        # The in-flight speculative pass, if any (speculate / commit_speculation /
+        # discard_speculation; see megatron.core.optimizer.muon_speculative_clip).
+        self._speculation: _Speculation | None = None
+        self._warned_speculation_l2 = False
 
     def set_param_ns_homes(self, param_ns_homes: dict[int, tuple[int, int]]) -> None:
         """Set the NS home for each param (by id).
@@ -637,6 +660,15 @@ class LayerShardedMuon(TensorParallelMuon):
             self._profiling_skip_step()
             return None
 
+        if self._speculation is not None:
+            # Speculative clipping: a verified hit commits the staged pass (bit-identical to
+            # the step below); anything else is dropped and the exact step runs on the, by
+            # now possibly clipped, gradients.
+            if self._speculation.verdict is True:
+                self.commit_speculation()
+                return None
+            self.discard_speculation()
+
         # Fall back to TensorParallelMuon until homes are set: all-gather + TP-aware
         # full-matrix Newton-Schulz per param (with the groups from pg_collection).
         # Mathematically correct, just redundant: every rank recomputes every matrix.
@@ -749,193 +781,382 @@ class LayerShardedMuon(TensorParallelMuon):
             tp_complete=by_tp_dim[None],
         )
 
-    def _step_groups(self, streams: list | None, ready: torch.cuda.Event | None) -> None:
+    def _group_setup(self, group_index: int, group: dict):
+        """Resolve one param group's domain, grad-bearing params and exchange plan.
+
+        Shared by the normal step and the speculative pass so both see the same params in
+        the same order; the exchange plan and the Newton-Schulz batching are keyed on it.
+        Returns None when no param of the group has a grad.
+        """
+        # Each param group may live in its own domain (dense vs expert).
+        gtp_remat_group, tp_group = self._group_process_groups.get(
+            group_index, (self.gtp_remat_group, self.tp_group)
+        )
+        params = [p for p in group["params"] if p.grad is not None]
+        if not params:
+            return None
+        plan = self._plan_for(group_index, params, gtp_remat_group, tp_group)
+        return gtp_remat_group, tp_group, params, plan
+
+    def _local_ns_inputs(self, params: list, beta: float, in_place: bool) -> list:
+        """Momentum update -> this rank's local Newton-Schulz inputs (fp32), one per param:
+        the Nesterov-corrected direction, or the momentum itself.
+
+        ``in_place=True`` is the normal step: ``lerp_`` the momentum buffers. ``in_place=False``
+        is the speculative pass: the same lerp out of place, so the buffers stay at step t-1
+        until :meth:`commit_speculation` replays the in-place ``lerp_`` on the same operands
+        (same kernel, hence bit-identical results).
+
+        NOTE: with ``nesterov=False`` and ``in_place=True`` the returned tensors alias the
+        momentum buffers (``.float()`` is a no-op on fp32); callers treat them as read-only.
+        """
+        local_ns_inputs: list[torch.Tensor] = []
+        for p in params:
+            grad = p.grad
+            buf = self.state[p]["momentum_buffer"]
+            if in_place:
+                buf.lerp_(grad, 1 - beta)
+                momentum = buf
+            else:
+                momentum = buf.lerp(grad, 1 - beta)
+            local_ns_input = grad.lerp(momentum, beta) if self.nesterov else momentum
+            local_ns_inputs.append(local_ns_input.float())
+        return local_ns_inputs
+
+    def _apply_group(self, params, plan, replicated_ns_outputs, update_shards, lr) -> None:
+        """Step 8: the weight updates, replicated params first (their NS ran first)."""
+        with _phase("update"):
+            for i, ns_output in replicated_ns_outputs.items():
+                self._apply_update(params[i], ns_output, lr)
+            for i, shard in zip(plan.routed, update_shards):
+                if shard is not None:
+                    self._apply_update(params[i], shard, lr)
+
+    def _step_groups(self, streams: list | None, ready: Any) -> None:
         for group_index, group in enumerate(self.param_groups):
             if streams is not None:
                 # Wait for the backward that produced these grads, then run this
                 # group's whole pipeline on its own stream.
                 streams[group_index].wait_event(ready)
                 torch.cuda.set_stream(streams[group_index])
-            # Each param group may live in its own domain (dense vs expert).
-            gtp_remat_group, tp_group = self._group_process_groups.get(
-                group_index, (self.gtp_remat_group, self.tp_group)
-            )
-
             self._init_group(group)
+            setup = self._group_setup(group_index, group)
+            if setup is None:
+                continue
+            gtp_remat_group, tp_group, params, plan = setup
             lr = group["lr"]
             beta = group["momentum"]
 
-            params = [p for p in group["params"] if p.grad is not None]
-            if not params:
-                continue
-            plan = self._plan_for(group_index, params, gtp_remat_group, tp_group)
-
-            # 1. Momentum update on the local shard. Each entry is this rank's local
-            #    Newton-Schulz input: the Nesterov-corrected direction, or the momentum
-            #    buffer itself.
-            # NOTE: with nesterov=False, ``local_ns_inputs[i]`` aliases the momentum buffer
-            # (``.float()`` is a no-op on fp32); everything below treats it as read-only.
-            local_ns_inputs: list[torch.Tensor] = []
+            # 1. Weight decay (decoupled: on the param; l2: on the grad) and the momentum
+            #    update on the local shard. All decays before all lerps is the same per-param
+            #    arithmetic as interleaving them: the two touch different tensors.
             with _phase("momentum"):
                 for p in params:
-                    grad = p.grad
-                    state = self.state[p]
-                    self._apply_weight_decay_inplace(p, grad, lr, group["weight_decay"])
-                    state["momentum_buffer"].lerp_(grad, 1 - beta)
-                    if self.nesterov:
-                        local_ns_input = grad.lerp(state["momentum_buffer"], beta)
-                    else:
-                        local_ns_input = state["momentum_buffer"]
-                    local_ns_inputs.append(local_ns_input.float())
+                    self._apply_weight_decay_inplace(p, p.grad, lr, group["weight_decay"])
+                local_ns_inputs = self._local_ns_inputs(params, beta, in_place=True)
 
-            # 2. Replicated params (whole on every rank of the domain, which is every param
-            #    of a single-rank domain): local Newton-Schulz on each rank's own copy,
-            #    batched by shape. Correct and cheaper than electing a home and
-            #    broadcasting the result back.
-            if plan.replicated:
-                with _phase("ns_replicated"), fp32_matmul_precision(self.fp32_matmul_prec):
-                    replicated_ns_outputs = self._run_ns(
-                        {i: local_ns_inputs[i] for i in plan.replicated}
-                    )
-                    for i, ns_output in replicated_ns_outputs.items():
-                        self._apply_update(params[i], ns_output, lr)
-            if not plan.routed:
-                continue
-            # The rank-local shards that enter the GTP_remat / TP routing path.
-            local_param_shards = [params[i] for i in plan.routed]
-            local_ns_input_shards = [local_ns_inputs[i] for i in plan.routed]
-            stage1_routed_indices = plan.stage1_routed_indices
-            route_plans = plan.route_plans
+            # 2-7. Replicated NS, exchanges and the homes' NS.
+            replicated_ns_outputs, update_shards = self._orthogonalize_group(
+                plan, params, local_ns_inputs, gtp_remat_group, tp_group
+            )
+            # 8. Weight update on the local shard.
+            self._apply_group(params, plan, replicated_ns_outputs, update_shards, lr)
 
-            with fp32_matmul_precision(self.fp32_matmul_prec):
-                with _phase("a2a_fwd"):
-                    # 3. Stage-1 all_to_all over gtp_remat (dim 0): each param's gtp_remat
-                    #    extent is assembled on its g_home column. The router delivers the
-                    #    same params to this rank as ``plan.stage1_routed_indices`` (both
-                    #    use params_by_home).
-                    stage1_ns_inputs, _ = route_to_ns_home(
-                        local_ns_input_shards,
-                        plan.g_home,
-                        gtp_remat_group,
-                        0,
-                        plan=route_plans.setdefault("s1f", {}),
-                    )
-                    # Strip the GTP alignment padding at the stage-1 seam: the stage-1
-                    # output is the gtp-gathered TP-LOCAL tensor, where the pad is a
-                    # contiguous dim-0 tail for every partition dim (after TP assembly it
-                    # would be embedded per TP block), the same strip point the parent's
-                    # duplicated path uses.
-                    stage1_ns_inputs = [
-                        self._strip_pad(t, plan.pad_lengths[stage1_routed_indices[k]])
-                        for k, t in enumerate(stage1_ns_inputs)
-                    ]
+    def _orthogonalize_group(
+        self,
+        plan: _GroupExchangePlan,
+        params: list,
+        local_ns_inputs: list,
+        gtp_remat_group,
+        tp_group,
+    ) -> tuple[dict, list]:
+        """Steps 2-7 of the pipeline: replicated Newton-Schulz, stage-1/2 exchange, Newton-Schulz
+        on the homes, reverse exchange. Applies nothing.
 
-                    # 4. Stage-2 all_to_all over TP, one exchange per partition dim.
-                    #    GTP_REMAT-only params skip it: every TP peer of the column already
-                    #    holds their full matrix. Both dicts below are keyed by ``k``, the
-                    #    stage-1 index.
-                    full_ns_inputs_by_stage1_index: dict[int, torch.Tensor] = {}
-                    # Forward TP-routing state the reverse exchange needs, per partition dim:
-                    # the TP-local shards sent and the positions this rank's home received.
-                    tp_reverse_context_by_partition_dim: dict[
-                        int, tuple[list[torch.Tensor], list[int]]
-                    ] = {}
-                    for pd, (positions, t_home) in plan.tp_exchanges.items():
-                        tp_local_ns_input_shards = [stage1_ns_inputs[k] for k in positions]
-                        local_full_ns_inputs, tp_input_indices_for_local_home = route_to_ns_home(
-                            tp_local_ns_input_shards,
-                            t_home,
-                            tp_group,
-                            pd,
-                            plan=route_plans.setdefault(("s2f", pd), {}),
-                        )
-                        tp_reverse_context_by_partition_dim[pd] = (
-                            tp_local_ns_input_shards,
-                            tp_input_indices_for_local_home,
-                        )
-                        for tp_index, full_ns_input in zip(
-                            tp_input_indices_for_local_home, local_full_ns_inputs
-                        ):
-                            full_ns_inputs_by_stage1_index[positions[tp_index]] = full_ns_input
-                    for k in plan.tp_complete:
-                        full_ns_inputs_by_stage1_index[k] = stage1_ns_inputs[k]
+        Returns ``(replicated_ns_outputs, update_shards)``: the scaled NS outputs keyed by the
+        index into ``params`` for the REPLICATED params, and the update shards aligned with
+        ``plan.routed`` (None where this rank received nothing; does not occur in normal use).
+        """
+        # 2. Replicated params (whole on every rank of the domain, which is every param
+        #    of a single-rank domain): local Newton-Schulz on each rank's own copy,
+        #    batched by shape. Correct and cheaper than electing a home and
+        #    broadcasting the result back.
+        replicated_ns_outputs: dict[int, torch.Tensor] = {}
+        if plan.replicated:
+            with _phase("ns_replicated"), fp32_matmul_precision(self.fp32_matmul_prec):
+                replicated_ns_outputs = self._run_ns(
+                    {i: local_ns_inputs[i] for i in plan.replicated}
+                )
+        if not plan.routed:
+            return replicated_ns_outputs, []
+        # The rank-local shards that enter the GTP_remat / TP routing path.
+        local_ns_input_shards = [local_ns_inputs[i] for i in plan.routed]
+        stage1_routed_indices = plan.stage1_routed_indices
+        route_plans = plan.route_plans
 
-                # 5. Full-matrix Newton-Schulz on the home (identical to duplicated mode),
-                #    batched by shape; see _run_ns. The TP-complete (GTP_REMAT-only)
-                #    subset runs through its OWN _run_ns call: every TP column
-                #    orthogonalizes those matrices independently and scatters its own
-                #    result over gtp_remat alone, so their batch chunking must not depend
-                #    on the column's TP-sharded params (a different set per column).
-                #    Pooled chunking would put the same replicated matrix in a baddbmm
-                #    chunk on one column and addmm on another, and the TP replicas of its
-                #    weight would drift apart and compound every step.
-                tp_complete_indices = set(plan.tp_complete)
-                with _phase("ns"):
-                    ns_outputs_by_stage1_index = self._run_ns(
-                        {
-                            k: v
-                            for k, v in full_ns_inputs_by_stage1_index.items()
-                            if k not in tp_complete_indices
-                        }
-                    )
-                    ns_outputs_by_stage1_index.update(
-                        self._run_ns(
-                            {k: full_ns_inputs_by_stage1_index[k] for k in plan.tp_complete}
-                        )
-                    )
-
-            with _phase("a2a_bwd"):
-                # 6. Reverse stage-2 all_to_all: scatter NS results back to TP parts. The
-                #    result, per stage-1 index, is the update for the TP-local shard.
-                stage1_update_shards: list = [None] * len(stage1_routed_indices)
-                for pd, (positions, t_home) in plan.tp_exchanges.items():
-                    tp_local_ns_input_shards, tp_input_indices_for_local_home = (
-                        tp_reverse_context_by_partition_dim[pd]
-                    )
-                    tp_ns_outputs = [
-                        ns_outputs_by_stage1_index[positions[tp_index]]
-                        for tp_index in tp_input_indices_for_local_home
-                    ]
-                    tp_update_shards = route_from_ns_home(
-                        tp_ns_outputs,
-                        tp_input_indices_for_local_home,
-                        tp_local_ns_input_shards,
-                        t_home,
-                        tp_group,
-                        pd,
-                        plan=route_plans.setdefault(("s2b", pd), {}),
-                    )
-                    for tp_index, tp_update_shard in enumerate(tp_update_shards):
-                        stage1_update_shards[positions[tp_index]] = tp_update_shard
-                for k in plan.tp_complete:
-                    stage1_update_shards[k] = ns_outputs_by_stage1_index[k]
-
-                # Restore the padding (zero rows) before the reverse gtp_remat exchange:
-                # its split sizes derive from the padded momentum shards, and every
-                # rank's shard slice must line up again.
-                stage1_update_shards = [
-                    (
-                        None
-                        if t is None
-                        else self._restore_pad(t, plan.pad_lengths[stage1_routed_indices[k]])
-                    )
-                    for k, t in enumerate(stage1_update_shards)
-                ]
-
-                # 7. Reverse stage-1 all_to_all: scatter the TP-local updates back to the
-                #    gtp_remat shards.
-                update_shards = route_from_ns_home(
-                    stage1_update_shards,
-                    stage1_routed_indices,
+        with fp32_matmul_precision(self.fp32_matmul_prec):
+            with _phase("a2a_fwd"):
+                # 3. Stage-1 all_to_all over gtp_remat (dim 0): each param's gtp_remat
+                #    extent is assembled on its g_home column. The router delivers the
+                #    same params to this rank as ``plan.stage1_routed_indices`` (both
+                #    use params_by_home).
+                stage1_ns_inputs, _ = route_to_ns_home(
                     local_ns_input_shards,
                     plan.g_home,
                     gtp_remat_group,
                     0,
-                    plan=route_plans.setdefault("s1b", {}),
+                    plan=route_plans.setdefault("s1f", {}),
+                )
+                # Strip the GTP alignment padding at the stage-1 seam: the stage-1
+                # output is the gtp-gathered TP-LOCAL tensor, where the pad is a
+                # contiguous dim-0 tail for every partition dim (after TP assembly it
+                # would be embedded per TP block), the same strip point the parent's
+                # duplicated path uses.
+                stage1_ns_inputs = [
+                    self._strip_pad(t, plan.pad_lengths[stage1_routed_indices[k]])
+                    for k, t in enumerate(stage1_ns_inputs)
+                ]
+
+                # 4. Stage-2 all_to_all over TP, one exchange per partition dim.
+                #    GTP_REMAT-only params skip it: every TP peer of the column already
+                #    holds their full matrix. Both dicts below are keyed by ``k``, the
+                #    stage-1 index.
+                full_ns_inputs_by_stage1_index: dict[int, torch.Tensor] = {}
+                # Forward TP-routing state the reverse exchange needs, per partition dim:
+                # the TP-local shards sent and the positions this rank's home received.
+                tp_reverse_context_by_partition_dim: dict[
+                    int, tuple[list[torch.Tensor], list[int]]
+                ] = {}
+                for pd, (positions, t_home) in plan.tp_exchanges.items():
+                    tp_local_ns_input_shards = [stage1_ns_inputs[k] for k in positions]
+                    local_full_ns_inputs, tp_input_indices_for_local_home = route_to_ns_home(
+                        tp_local_ns_input_shards,
+                        t_home,
+                        tp_group,
+                        pd,
+                        plan=route_plans.setdefault(("s2f", pd), {}),
+                    )
+                    tp_reverse_context_by_partition_dim[pd] = (
+                        tp_local_ns_input_shards,
+                        tp_input_indices_for_local_home,
+                    )
+                    for tp_index, full_ns_input in zip(
+                        tp_input_indices_for_local_home, local_full_ns_inputs
+                    ):
+                        full_ns_inputs_by_stage1_index[positions[tp_index]] = full_ns_input
+                for k in plan.tp_complete:
+                    full_ns_inputs_by_stage1_index[k] = stage1_ns_inputs[k]
+
+            # 5. Full-matrix Newton-Schulz on the home (identical to duplicated mode),
+            #    batched by shape; see _run_ns. The TP-complete (GTP_REMAT-only)
+            #    subset runs through its OWN _run_ns call: every TP column
+            #    orthogonalizes those matrices independently and scatters its own
+            #    result over gtp_remat alone, so their batch chunking must not depend
+            #    on the column's TP-sharded params (a different set per column).
+            #    Pooled chunking would put the same replicated matrix in a baddbmm
+            #    chunk on one column and addmm on another, and the TP replicas of its
+            #    weight would drift apart and compound every step.
+            tp_complete_indices = set(plan.tp_complete)
+            with _phase("ns"):
+                ns_outputs_by_stage1_index = self._run_ns(
+                    {
+                        k: v
+                        for k, v in full_ns_inputs_by_stage1_index.items()
+                        if k not in tp_complete_indices
+                    }
+                )
+                ns_outputs_by_stage1_index.update(
+                    self._run_ns({k: full_ns_inputs_by_stage1_index[k] for k in plan.tp_complete})
                 )
 
-            # 8. Weight update on the local shard.
-            with _phase("update"):
-                for p, shard in zip(local_param_shards, update_shards):
-                    if shard is not None:
-                        self._apply_update(p, shard, lr)
+        with _phase("a2a_bwd"):
+            # 6. Reverse stage-2 all_to_all: scatter NS results back to TP parts. The
+            #    result, per stage-1 index, is the update for the TP-local shard.
+            stage1_update_shards: list = [None] * len(stage1_routed_indices)
+            for pd, (positions, t_home) in plan.tp_exchanges.items():
+                tp_local_ns_input_shards, tp_input_indices_for_local_home = (
+                    tp_reverse_context_by_partition_dim[pd]
+                )
+                tp_ns_outputs = [
+                    ns_outputs_by_stage1_index[positions[tp_index]]
+                    for tp_index in tp_input_indices_for_local_home
+                ]
+                tp_update_shards = route_from_ns_home(
+                    tp_ns_outputs,
+                    tp_input_indices_for_local_home,
+                    tp_local_ns_input_shards,
+                    t_home,
+                    tp_group,
+                    pd,
+                    plan=route_plans.setdefault(("s2b", pd), {}),
+                )
+                for tp_index, tp_update_shard in enumerate(tp_update_shards):
+                    stage1_update_shards[positions[tp_index]] = tp_update_shard
+            for k in plan.tp_complete:
+                stage1_update_shards[k] = ns_outputs_by_stage1_index[k]
+
+            # Restore the padding (zero rows) before the reverse gtp_remat exchange:
+            # its split sizes derive from the padded momentum shards, and every
+            # rank's shard slice must line up again.
+            stage1_update_shards = [
+                (
+                    None
+                    if t is None
+                    else self._restore_pad(t, plan.pad_lengths[stage1_routed_indices[k]])
+                )
+                for k, t in enumerate(stage1_update_shards)
+            ]
+
+            # 7. Reverse stage-1 all_to_all: scatter the TP-local updates back to the
+            #    gtp_remat shards.
+            update_shards = route_from_ns_home(
+                stage1_update_shards,
+                stage1_routed_indices,
+                local_ns_input_shards,
+                plan.g_home,
+                gtp_remat_group,
+                0,
+                plan=route_plans.setdefault("s1b", {}),
+            )
+
+        return replicated_ns_outputs, update_shards
+
+    # ------------------------------------------------------------------ speculation
+    @torch.no_grad()
+    def speculate(self, launch_stream: Any) -> bool:
+        """Run the pipeline into staging on side streams, touching no optimizer state.
+
+        Speculative clipping (:mod:`megatron.core.optimizer.muon_speculative_clip`): called
+        on the final but still unclipped ``p.grad``, before the global grad norm exists.
+        Momentum is computed out of place, the exchanges and Newton-Schulz run exactly as in
+        :meth:`step`, and the resulting updates are kept aside. Params and momentum buffers
+        stay at step t-1, so :meth:`commit_speculation` reproduces :meth:`step` bit for bit
+        when the clip does not bind, and :meth:`discard_speculation` costs nothing but the
+        wasted pass. The host never blocks: the pass is enqueued on ``launch_stream`` (and on
+        the per-group streams when ``concurrent_groups`` applies), ordered after the caller's
+        current stream, and ``launch_stream`` carries the completion event.
+
+        Returns:
+            True when a pass was staged. False when the layer-sharded path is inactive (no
+            homes), a pass is already staged, no param has a grad, or l2 weight decay would
+            modify the gradients inside the step (not replayable; logged once).
+        """
+        if not self._homes_set or self._speculation is not None:
+            return False
+        if getattr(self, "weight_decay_method", "l2") == "l2" and any(
+            group.get("weight_decay", 0.0) != 0.0 for group in self.param_groups
+        ):
+            if not self._warned_speculation_l2:
+                self._warned_speculation_l2 = True
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
+                    "LayerShardedMuon.speculate: l2 weight decay modifies the gradient before "
+                    "the momentum update, which the speculative pass does not replay; "
+                    "speculation disabled for this optimizer (use decoupled weight decay).",
+                )
+            return False
+        # Persistent state (momentum buffers) is allocated on the caller's stream, not on the
+        # scratch streams below.
+        for group in self.param_groups:
+            self._init_group(group)
+        setups = [
+            (group_index, group, self._group_setup(group_index, group))
+            for group_index, group in enumerate(self.param_groups)
+        ]
+        if all(setup is None for _, _, setup in setups):
+            return False
+
+        streams = self._param_group_streams()
+        current = torch.cuda.current_stream()
+        ready = torch.cuda.Event()
+        ready.record(current)
+        staged: dict[int, _StagedGroup] = {}
+        with torch.cuda.stream(launch_stream):
+            launch_stream.wait_event(ready)
+            try:
+                for group_index, group, setup in setups:
+                    if setup is None:
+                        continue
+                    if streams is not None:
+                        streams[group_index].wait_event(ready)
+                        torch.cuda.set_stream(streams[group_index])
+                    gtp_remat_group, tp_group, params, plan = setup
+                    with _phase("spec_momentum"):
+                        local_ns_inputs = self._local_ns_inputs(
+                            params, group["momentum"], in_place=False
+                        )
+                    replicated_ns_outputs, update_shards = self._orthogonalize_group(
+                        plan, params, local_ns_inputs, gtp_remat_group, tp_group
+                    )
+                    staged[group_index] = _StagedGroup(
+                        params, plan, replicated_ns_outputs, update_shards
+                    )
+            finally:
+                torch.cuda.set_stream(launch_stream)
+                for stream in streams or ():
+                    launch_stream.wait_stream(stream)
+            done = torch.cuda.Event()
+            done.record(launch_stream)
+        self._speculation = _Speculation(groups=staged, done=done)
+        return True
+
+    def has_speculation(self) -> bool:
+        """Whether a speculative pass is staged (verified or not)."""
+        return self._speculation is not None
+
+    def set_speculation_verdict(self, hit: bool) -> None:
+        """Record the clip verdict for the staged pass; :meth:`step` acts on it."""
+        if self._speculation is not None:
+            self._speculation.verdict = hit
+
+    @torch.no_grad()
+    def commit_speculation(self) -> None:
+        """Apply a verified speculative pass.
+
+        Replays the in-place state changes of :meth:`step` on the same operands -- weight
+        decay on the param, the momentum ``lerp_`` -- then applies the staged updates. The
+        result is bit-identical to the step the pass replaced: an unbound clip left
+        ``p.grad`` untouched, the lerp sees the same operands, and Newton-Schulz is
+        deterministic.
+        """
+        speculation = self._speculation
+        self._speculation = None
+        if speculation is None:
+            return
+        current = torch.cuda.current_stream()
+        if speculation.done is not None:
+            current.wait_event(speculation.done)
+        with _phase("commit"):
+            for group_index, staged in speculation.groups.items():
+                group = self.param_groups[group_index]
+                lr = group["lr"]
+                beta = group["momentum"]
+                for p in staged.params:
+                    self._apply_weight_decay_inplace(p, p.grad, lr, group["weight_decay"])
+                    self.state[p]["momentum_buffer"].lerp_(p.grad, 1 - beta)
+                self._apply_group(
+                    staged.params,
+                    staged.plan,
+                    staged.replicated_ns_outputs,
+                    staged.update_shards,
+                    lr,
+                )
+                # The staged tensors were allocated on the side streams and are consumed
+                # here; tell the caching allocator before the references drop.
+                for tensor in staged.replicated_ns_outputs.values():
+                    tensor.record_stream(current)
+                for tensor in staged.update_shards:
+                    if tensor is not None:
+                        tensor.record_stream(current)
+
+    def discard_speculation(self) -> None:
+        """Drop a staged pass (clip bound, non-finite norm, skipped update, or unverified).
+
+        The current stream is ordered behind the pass first, so the staged buffers are not
+        released while their producers may still be running.
+        """
+        speculation = self._speculation
+        self._speculation = None
+        if speculation is not None and speculation.done is not None:
+            torch.cuda.current_stream().wait_event(speculation.done)

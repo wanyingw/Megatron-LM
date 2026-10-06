@@ -689,6 +689,16 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         # resolved per param group inside the helper.
         self._wire_layer_sharding_ns_homes(optimizers, pg_collection)
 
+        # Speculative gradient clipping (config.muon_speculative_clip): the LayerShardedMuon
+        # pipelines start before the global grad norm exists and are committed or dropped once
+        # it does. The hooks live on this optimizer; the top-level ChainedOptimizer.step fires
+        # its children's hooks (this optimizer's own step() is bypassed when nested).
+        self.speculative_clip = None
+        if getattr(config, 'muon_speculative_clip', False):
+            from .muon_speculative_clip import SpeculativeMuonClip
+
+            self.speculative_clip = SpeculativeMuonClip.wire(self, optimizers, config)
+
         # TODO(kunlun, deyuf): potential future perf optimization
         # since allreduce is unchanged and handled by megatron DDP, they're already in
         # contiguous gbuf. So instead of shard param by layer randomly, we can shard by

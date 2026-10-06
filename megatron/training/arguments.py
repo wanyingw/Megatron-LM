@@ -2886,6 +2886,18 @@ def _add_regularization_args(parser):
                        'when the concurrent transient buffers push peak memory too high.')
     group.add_argument('--muon-extra-scale-factor', type=float, default=1.0,
                        help='Additional scale factor for the muon update')
+    group.add_argument('--muon-speculative-clip', action='store_true',
+                       help='Speculative gradient clipping for --muon-tp-mode layer_sharded: '
+                       'launch the Muon pipeline on side streams before the global grad norm '
+                       'is known (assuming the clip will not bind) and commit the staged '
+                       'result once it is, bit-identical to the normal step; if the clip '
+                       'binds the pass is dropped and recomputed on the clipped gradients. '
+                       'Takes the norm kernels, the norm all-reduce (and its wait for the '
+                       'slowest rank) and the clip off the Muon step\'s critical path. '
+                       'Requires decoupled weight decay. See OptimizerConfig.muon_speculative_clip.')
+    group.add_argument('--muon-speculative-clip-warmup-steps', type=int, default=10,
+                       help='Consecutive non-binding iterations before --muon-speculative-clip '
+                       'starts speculating; any bind resets the count. Default 10.')
     # Backward <-> Muon overlap profiling (megatron/training/muon_overlap_profiling.py).
     group.add_argument('--muon-overlap-probe', action='store_true',
                        help='Profiling: log CUDA-event timing of every DDP bucket group\'s grad '

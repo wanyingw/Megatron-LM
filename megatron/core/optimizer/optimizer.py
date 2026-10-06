@@ -1527,8 +1527,11 @@ class ChainedOptimizer(MegatronOptimizer):
         else:
             self.is_stub_optimizer = True
         self.chained_optimizers = chained_optimizers
-        # Observers called with the global grad norm in step(), right after it is computed and
-        # before clipping (profiling hooks; see megatron.training.muon_overlap_profiling).
+        # Observers fired by step(): pre_grad_norm_callbacks() once prepare_grads() succeeded
+        # and before the global grad norm is computed; post_grad_norm_callbacks(grad_norm) right
+        # after it, before clipping. Used by speculative Muon clipping
+        # (megatron.core.optimizer.muon_speculative_clip) and the overlap profiling probe.
+        self.pre_grad_norm_callbacks = []
         self.post_grad_norm_callbacks = []
 
     @property
@@ -1963,6 +1966,15 @@ class ChainedOptimizer(MegatronOptimizer):
                 self.grad_norms_by_group[grad_norm_group] = group_grad_norm
         return self.grad_norms_by_group
 
+    def _step_callbacks(self, name: str):
+        """Callbacks registered under ``name`` on this optimizer and on its direct children.
+
+        A nested ChainedOptimizer (LayerWiseDistributedOptimizer under the top-level chain)
+        never runs its own step(), so hooks it registered on itself are fired from here.
+        """
+        for optimizer in [self, *self.chained_optimizers]:
+            yield from getattr(optimizer, name, ())
+
     @torch.no_grad()
     def step(self):
         """ChainedOptimizer will step all optimizers one by one.
@@ -1975,8 +1987,10 @@ class ChainedOptimizer(MegatronOptimizer):
         if found_inf_flag:
             return False, None, None
 
+        for callback in self._step_callbacks('pre_grad_norm_callbacks'):
+            callback()
         grad_norm = self.get_grad_norm()
-        for callback in getattr(self, 'post_grad_norm_callbacks', ()):
+        for callback in self._step_callbacks('post_grad_norm_callbacks'):
             callback(grad_norm)
         should_skip_update = False
 
