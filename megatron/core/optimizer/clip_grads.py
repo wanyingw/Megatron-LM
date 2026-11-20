@@ -144,6 +144,30 @@ def get_grad_norm_fp32(
     return total_norm
 
 
+def _clip_coeff(
+    max_norm: Union[int, float], total_norm: Union[float, torch.Tensor]
+) -> Union[float, torch.Tensor]:
+    """Coefficient ``clip_grad_by_total_norm_fp32`` scales by (a tensor is clamped to 1.0)."""
+    clip_coeff = max_norm / (total_norm + 1.0e-6)
+    if isinstance(clip_coeff, torch.Tensor):
+        clip_coeff.clamp_max_(1.0)
+    return clip_coeff
+
+
+def clip_leaves_grads_unchanged(
+    max_norm: Union[int, float], total_norm: Union[float, torch.Tensor]
+) -> bool:
+    """Whether ``clip_grad_by_total_norm_fp32`` leaves the gradients bitwise unchanged.
+
+    True only for a float norm whose coefficient is not below 1.0: the clip is then not
+    applied. A tensor norm is always scaled, and the scale kernel is not an identity at 1.0
+    (it flushes subnormals to zero), so it never counts as unchanged.
+    """
+    if isinstance(total_norm, torch.Tensor):
+        return False
+    return not _clip_coeff(max_norm, total_norm) < 1.0
+
+
 def clip_grad_by_total_norm_fp32(
     parameters: Union[List[torch.Tensor], torch.Tensor],
     max_norm: Union[int, float],
@@ -180,10 +204,9 @@ def clip_grad_by_total_norm_fp32(
                 grads.append(to_local_if_dtensor(param.grad).detach())
 
     # Scale.
-    clip_coeff = max_norm / (total_norm + 1.0e-6)
+    clip_coeff = _clip_coeff(max_norm, total_norm)
     dummy_overflow_buf = torch.zeros(1, dtype=torch.int, device='cuda')
     if isinstance(clip_coeff, torch.Tensor):
-        clip_coeff.clamp_max_(1.0)
         assert (
             multi_tensor_scale_tensor_impl is not None
         ), "clip_coeff is tensor type. But multi_tensor_scale_tensor not available."

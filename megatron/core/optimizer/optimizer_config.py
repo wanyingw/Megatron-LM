@@ -313,7 +313,10 @@ class OptimizerConfig:
     stages scatter the result back to the original shards. layer_sharded requires
     optimizer='muon', the layer-wise distributed optimizer path and muon_split_qkv=False
     (split-QKV Newton-Schulz is not implemented on the layer-sharded path); validate_run
-    checks all three. Defaults to "duplicated"."""
+    checks all three. With clip_grad > 0, layer_sharded computes the momentum update before
+    the global grad norm is known and keeps it when the clip is then not applied (a float
+    norm at or below clip_grad; bitwise equal to computing it afterwards). Defaults to
+    "duplicated"."""
 
     muon_use_syrk: bool = False
     """Use the Triton SYRK kernel for the Gram matrix in Newton-Schulz iteration."""

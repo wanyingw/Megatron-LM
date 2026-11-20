@@ -1125,6 +1125,119 @@ def test_exchange_plan_cache_bitwise_and_reused():
             assert current == plan_ids, "plan dicts were rebuilt on a warm step"
 
 
+def _serial_and_speculative(nesterov, steps, **muon_kwargs):
+    """Two identical optimizers on TP2 x GTP_remat2 (serial, then speculative), a setter that
+    gives both the gradients of a step, and a bitwise comparison of their weights and momentum."""
+    tp_group, gtp_remat_group = _get_2d_groups()
+    r = dist.get_rank()
+    t, g = r % 2, r // 2
+    torch.manual_seed(_SEED + 800)
+    full_w = [torch.randn(16, 12), torch.randn(8, 16)]
+    pdims = [0, 1]
+    grads = [[torch.randn_like(w) for w in full_w] for _ in range(steps)]
+    pairs = []
+    for _ in range(2):
+        params = [_mark_tp(_gtp_param(_shard_2d(w, pd, t, g)), pd) for w, pd in zip(full_w, pdims)]
+        opt = _muon(
+            params,
+            nesterov=nesterov,
+            gtp_remat_group=gtp_remat_group,
+            tp_group=tp_group,
+            **muon_kwargs,
+        )
+        opt.set_param_ns_homes({id(params[0]): (0, 1), id(params[1]): (1, 0)})
+        pairs.append((params, opt))
+
+    def set_grads(step):
+        for params, _ in pairs:
+            for i, p in enumerate(params):
+                p.grad = _shard_2d(grads[step][i], pdims[i], t, g)
+
+    def assert_same(step):
+        serial, speculative = (
+            [p.data for p in params] + [opt.state[p]["momentum_buffer"] for p in params]
+            for params, opt in pairs
+        )
+        for x, y in zip(serial, speculative):
+            assert torch.equal(x.view(torch.int32), y.view(torch.int32)), f"differs at step {step}"
+
+    return *pairs, set_grads, assert_same
+
+
+@pytest.mark.launch_on_gb200
+@pytest.mark.parametrize("nesterov, l2", [(False, False), (True, False), (True, True)])
+def test_speculative_momentum_is_bitwise_serial(nesterov, l2):
+    """Momentum staged before the clip verdict gives the serial step's weights and momentum
+    bit for bit: committed, recomputed after a binding clip, and dropped with a skipped update.
+    l2 weight decay rewrites the gradient inside the step, so nothing is staged under it."""
+    _require_four_ranks()
+    outcomes = ["commit", "bind", "skip", "commit"]
+    decay = dict(weight_decay=0.1, use_decoupled_weight_decay=False) if l2 else {}
+    (params_a, opt_a), (params_b, opt_b), set_grads, assert_same = _serial_and_speculative(
+        nesterov, len(outcomes), **decay
+    )
+    plan_ids = None
+    for step, outcome in enumerate(outcomes):
+        set_grads(step)
+        opt_b.speculate_momentum()
+        staged = dict(opt_b._staged_momentum)
+        assert len(staged) == (0 if l2 else len(params_b))
+        if outcome == "bind":  # the clip rewrites the gradients after the staging
+            for p in params_a + params_b:
+                p.grad.mul_(0.5)
+        opt_b.resolve_speculation(outcome == "commit")
+        if outcome != "skip":
+            opt_a.step()
+            opt_b.step()
+        assert_same(step)
+        committed = [opt_b.state[p]["momentum_buffer"] is staged.get(p) for p in params_b]
+        assert committed == [outcome == "commit" and not l2] * len(params_b)
+        assert not opt_b._staged_momentum and not opt_b._committed_momentum
+        if outcome != "skip":  # rebinding the momentum buffer leaves the cached plans in place
+            current = {tag: id(sub) for tag, sub in opt_b._plans[0].route_plans.items()}
+            plan_ids = plan_ids or current
+            assert current and current == plan_ids
+
+
+@pytest.mark.launch_on_gb200
+def test_speculative_momentum_through_mimo_step():
+    """``MimoOptimizer.step`` stages, commits and drops the momentum of a real optimizer: the
+    result equals the same clip followed by the serial step, bit for bit."""
+    from megatron.core.models.mimo.optimizer import MimoOptimizer, ModuleOptimizerInfo
+    from megatron.core.optimizer import OptimizerConfig
+    from megatron.core.optimizer.clip_grads import clip_grad_by_total_norm_fp32
+
+    _require_four_ranks()
+    norms = [0.5, 0.5, 2.0, 0.5, 0.5]  # clip_grad is 1.0: only the third step's clip binds
+    (params_a, opt_a), (params_b, opt_b), set_grads, assert_same = _serial_and_speculative(
+        True, len(norms)
+    )
+    config = OptimizerConfig(clip_grad=1.0)
+    module = SimpleNamespace(
+        optimizer=opt_b,
+        config=config,
+        is_stub_optimizer=False,
+        prepare_grads=lambda: False,
+        get_grad_norm=lambda: norm,
+        get_parameters=lambda: params_b,
+        step_with_ready_grads=lambda: opt_b.step() is None,
+    )
+    mimo = MimoOptimizer({"llm": ModuleOptimizerInfo(module, None, None, True)}, config)
+    buffers, rebound = None, []
+    for step, norm in enumerate(norms):
+        set_grads(step)
+        clip_grad_by_total_norm_fp32(params_a, 1.0, norm)
+        opt_a.step()
+        assert mimo.step() == (True, norm, None)
+        assert_same(step)
+        current = [opt_b.state[p]["momentum_buffer"] for p in params_b]
+        if buffers is not None:  # a committed staging replaces the buffer object
+            rebound.append(all(x is not y for x, y in zip(current, buffers)))
+        buffers = current
+    # A step stages after a step whose clip did not bind, and commits unless its own clip binds.
+    assert rebound == [True, False, False, True]
+
+
 def test_exchange_plan_rebuilds_when_param_set_changes():
     """Dropping a grad changes the routed param set: the plan must rebuild and the
     grad-less param must not move."""

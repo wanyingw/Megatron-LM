@@ -89,6 +89,7 @@ class MimoOptimizer(MegatronOptimizer):
         found_inf = found_inf_tensor.item() > 0
         if found_inf:
             return False, None, None
+        self._speculate_momentum()
 
         grad_norm = self.get_grad_norm()
 
@@ -105,6 +106,7 @@ class MimoOptimizer(MegatronOptimizer):
                     use_decoupled_grad=opt.config.use_precision_aware_optimizer,
                 )
 
+        self._resolve_speculation(False, [grad_norm])
         num_zeros = self.count_zeros() if self.config.log_num_zeros_in_grad else None
         success = self.step_with_ready_grads()
 

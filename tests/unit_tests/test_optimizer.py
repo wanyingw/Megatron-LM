@@ -944,6 +944,115 @@ def test_mtp_grad_separation_no_mtp_params():
         Utils.destroy_model_parallel()
 
 
+@pytest.mark.parametrize(
+    "stepper, main_norm, mtp_grad, skip_threshold, expected",
+    [
+        ("chained", 0.5, None, float("inf"), True),  # no clip is applied: commit
+        ("chained", 2.0, None, float("inf"), False),  # the main clip binds
+        ("chained", 0.5, 10.0, float("inf"), False),  # the clip of an MTP grad-norm group binds
+        ("chained", 0.5, None, 0.25, False),  # the update is skipped
+        ("mimo", 0.5, None, float("inf"), True),
+        ("mimo", 2.0, None, float("inf"), False),
+        ("mimo_two_clips", 0.5, None, float("inf"), True),  # a second module clips at 0.1
+    ],
+)
+def test_speculative_clip_verdict(stepper, main_norm, mtp_grad, skip_threshold, expected):
+    """The staged momentum is committed exactly when no clip of its own optimizer is applied
+    (float norms) and the update runs; a step stages only after a step in which all could commit."""
+    from megatron.core import parallel_state
+    from megatron.core.models.mimo.optimizer import MimoOptimizer, ModuleOptimizerInfo
+
+    class MockOptimizer:
+        """Mock child whose torch optimizer records the speculation calls."""
+
+        def __init__(self, config):
+            self.config = config
+            self.params = [torch.nn.Parameter(torch.ones(2, 2, device='cuda')) for _ in range(2)]
+            if mtp_grad is not None:
+                self.params[1].grad_norm_group = 'mtp'
+            self.param_groups = [{"params": self.params}]
+            self.is_stub_optimizer = False
+            self.calls = []
+            self.optimizer = SimpleNamespace(
+                speculate_momentum=lambda: self.calls.append("speculate"),
+                resolve_speculation=self.calls.append,
+            )
+
+        def set_grads(self):
+            for param, value in zip(self.params, (0.25, mtp_grad or 0.25)):
+                param.grad = torch.full_like(param, value)
+
+        def grads_unchanged(self):
+            values = zip(self.params, (0.25, mtp_grad or 0.25))
+            return all(bool((param.grad == value).all()) for param, value in values)
+
+        def prepare_grads(self):
+            return False
+
+        def get_grad_norm(self):
+            return main_norm
+
+        def get_parameters(self):
+            return self.params
+
+        def get_grad_stats_parallel_group(self):
+            return parallel_state.get_model_parallel_group()
+
+        def has_grad_norm_group(self, grad_norm_group):
+            return mtp_grad is not None
+
+        def get_grads_for_grad_norm(self, grad_norm_group=None):
+            return [self.params[1].grad]
+
+        def step_with_ready_grads(self):
+            return True
+
+    Utils.initialize_model_parallel()
+    try:
+        config = OptimizerConfig(clip_grad=1.0, grad_norm_skip_threshold=skip_threshold)
+        children = [MockOptimizer(config)]
+        if stepper == "chained":
+            optimizer = ChainedOptimizer(children)
+        else:
+            if stepper == "mimo_two_clips":
+                children.append(MockOptimizer(OptimizerConfig(clip_grad=0.1)))
+            infos = {
+                str(i): ModuleOptimizerInfo(c, None, None, True) for i, c in enumerate(children)
+            }
+            optimizer = MimoOptimizer(infos, config)
+
+        for _ in range(2):
+            for child in children:
+                child.set_grads()
+            update_successful, _, _ = optimizer.step()
+            # Each child's verdict is what its own clip did to its own gradients.
+            assert [c.calls[-1] for c in children] == [
+                c.grads_unchanged() and update_successful for c in children
+            ]
+        # The first step never stages; the second does only if every child could commit.
+        staged = ["speculate"] if expected and len(children) == 1 else []
+        assert children[0].calls == [expected, *staged, expected]
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize(
+    "options, applied",
+    [
+        ({}, True),
+        ({"clip_grad": 0.0}, False),  # no clip to wait for
+        ({"dsa_indexer_clip_grad": 1.0}, False),  # clipped with the split norms
+        ({"optimizer_cuda_graph": True}, False),  # no host branch in a captured step
+    ],
+)
+def test_speculative_clip_applies_only_with_a_plain_global_clip(options, applied):
+    """Momentum staging follows from the existing options; there is no flag for it."""
+    child = SimpleNamespace(
+        config=OptimizerConfig(**options), optimizer=SimpleNamespace(speculate_momentum=None)
+    )
+    assert ChainedOptimizer([child])._momentum_speculators() == ([child] if applied else [])
+
+
 def test_unregistered_grad_norm_group_raises():
     """Unknown grad-norm groups fail fast instead of silently joining the main norm."""
     from megatron.core.optimizer.optimizer import MegatronOptimizer

@@ -17,7 +17,12 @@ from megatron.core.optimizer import (
     _get_param_groups,
     get_standard_config_overrides,
 )
-from megatron.core.optimizer.clip_grads import clip_grad_by_total_norm_fp32, get_grad_norm_fp32
+from megatron.core.optimizer.clip_grads import (
+    clip_grad_by_total_norm_fp32,
+    clip_leaves_grads_unchanged,
+    get_grad_norm_fp32,
+    multi_tensor_scale_tensor_impl,
+)
 from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
@@ -102,6 +107,31 @@ class TestGradNormAndClip:
                 continue
             for j, (a, b) in enumerate(zip(ref, got)):
                 assert bytes_equal(a, b), f"clipped grad {j} differs on replay {i}"
+
+    @pytest.mark.parametrize("tensor_norm", [True, False])
+    def test_clip_verdict_never_misses_a_changed_bit(self, tensor_norm):
+        """clip_leaves_grads_unchanged is True only when the clip changes no bit: for a float
+        norm at or below max_norm. A tensor norm is always scaled, so it is never True."""
+        if tensor_norm and multi_tensor_scale_tensor_impl is None:
+            pytest.skip("needs multi_tensor_scale_tensor")
+        seeded()
+        grads = _grads(num=8)
+        # Values an applied scale may not keep even at 1.0: negative zero and a subnormal.
+        grads[0][:2] = torch.tensor([-0.0, 1e-45], device="cuda")
+        verdicts = []
+        # Just below, at and just above max_norm; the clip adds 1e-6 to the norm.
+        for norm in (1.0 - 1e-3, 1.0, 1.0 + 1e-3):
+            norm = torch.tensor(norm, device="cuda") if tensor_norm else norm
+            params = []
+            for g in grads:
+                p = torch.zeros_like(g)
+                p.grad = g.clone()
+                params.append(p)
+            verdicts.append(clip_leaves_grads_unchanged(1.0, norm))
+            clip_grad_by_total_norm_fp32(params, 1.0, norm)
+            unchanged = all(bytes_equal(p.grad, g) for p, g in zip(params, grads))
+            assert unchanged or not verdicts[-1]
+        assert verdicts == ([False] * 3 if tensor_norm else [True, False, False])
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])

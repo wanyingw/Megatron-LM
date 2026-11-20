@@ -49,7 +49,12 @@ from ..dist_checkpointing.utils import add_prefix_for_sharding
 from ..optimizer_param_scheduler import ParamGroupOverride as _ParamGroupOverride
 from ..transformer.module import param_is_not_shared
 from ..utils import log_single_rank
-from .clip_grads import clip_grad_by_total_norm_fp32, count_zeros_fp32, get_grad_norm_fp32
+from .clip_grads import (
+    clip_grad_by_total_norm_fp32,
+    clip_leaves_grads_unchanged,
+    count_zeros_fp32,
+    get_grad_norm_fp32,
+)
 from .grad_scaler import MegatronGradScaler
 from .optimizer_config import OptimizerConfig
 
@@ -530,6 +535,54 @@ class MegatronOptimizer(ABC):
         if hasattr(self, 'grad_stats_parallel_group'):
             return self.grad_stats_parallel_group
         return parallel_state.get_model_parallel_group()
+
+    # Speculative clipping: whether the next step stages momentum. Host state derived from
+    # all-reduced norms, so equal on every rank; a restart starts from False (bitwise either way).
+    _speculate_next_step = False
+
+    def _momentum_speculators(self) -> List["MegatronOptimizer"]:
+        """Optimizers below this one whose torch optimizer can stage momentum (LayerShardedMuon).
+
+        None without a global clip to wait for, with the DSA split clip (other norms), or under
+        the optimizer CUDA graph (the verdict is a host branch).
+        """
+        config = getattr(self, 'config', None)
+        if (
+            getattr(config, 'clip_grad', 0.0) <= 0.0
+            or getattr(config, 'dsa_indexer_clip_grad', None) is not None
+            or getattr(config, 'optimizer_cuda_graph', False)
+        ):
+            return []
+        found = []
+        for optimizer in getattr(self, 'chained_optimizers', []):
+            if hasattr(optimizer, 'chained_optimizers'):
+                found += optimizer._momentum_speculators()
+            elif hasattr(getattr(optimizer, 'optimizer', None), 'speculate_momentum'):
+                found.append(optimizer)
+        return found
+
+    def _speculate_momentum(self) -> None:
+        """Stage the Muon momentum from the unclipped gradients, before the norm is known."""
+        if self._speculate_next_step:
+            for owner in self._momentum_speculators():
+                owner.optimizer.speculate_momentum()
+
+    def _resolve_speculation(self, skip: bool, norms: List[Union[float, torch.Tensor]]) -> None:
+        """Commit the staged momentum iff the update runs and no clip changed a gradient.
+
+        ``norms`` are the norms this step clipped with; each owner is tested with its own
+        ``config.clip_grad``. The next step stages only if every owner committed.
+        """
+        commits: Dict[float, bool] = {}
+        for owner in self._momentum_speculators():
+            clip_grad = owner.config.clip_grad
+            if clip_grad not in commits:
+                commits[clip_grad] = not skip and all(
+                    clip_leaves_grads_unchanged(clip_grad, norm) for norm in norms
+                )
+            owner.optimizer.resolve_speculation(commits[clip_grad])
+        if commits:
+            self._speculate_next_step = all(commits.values())
 
     @abstractmethod
     def prepare_grads(self) -> bool:
@@ -2318,6 +2371,7 @@ class ChainedOptimizer(MegatronOptimizer):
         found_inf_flag = self.prepare_grads()
         if found_inf_flag:
             return False, None, None
+        self._speculate_momentum()
 
         self._last_dsa_split_grad_norms = None
         if self.config.dsa_indexer_clip_grad is not None:
@@ -2404,6 +2458,10 @@ class ChainedOptimizer(MegatronOptimizer):
                     logger, logging.INFO, "skipping grad norm because it's too large %s", grad_norm
                 )
                 should_skip_update = True
+
+        self._resolve_speculation(
+            should_skip_update, [grad_norm, *self.grad_norms_by_group.values()]
+        )
 
         # Count the zeros in the grads.
         num_zeros_in_grad = self.count_zeros() if self.config.log_num_zeros_in_grad else None

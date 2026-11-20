@@ -470,6 +470,10 @@ class LayerShardedMuon(TensorParallelMuon):
         # grad on some step safely trigger a rebuild. Metadata only, never buffers:
         # persistent exchange buffers would raise steady-state memory between steps.
         self._plans: dict[int, _GroupExchangePlan] = {}
+        # Speculative clipping: param -> next momentum, staged before the grad norm is known
+        # (speculate_momentum) and handed to step() only by resolve_speculation(True).
+        self._staged_momentum: dict[torch.Tensor, torch.Tensor] = {}
+        self._committed_momentum: dict[torch.Tensor, torch.Tensor] = {}
 
     def set_param_ns_homes(self, param_ns_homes: dict[int, tuple[int, int]]) -> None:
         """Set the NS home for each param (by id).
@@ -502,6 +506,30 @@ class LayerShardedMuon(TensorParallelMuon):
         self._group_process_groups = group_process_groups
         self._warned_shared_domain = False
         self._plans.clear()
+
+    @torch.no_grad()
+    def speculate_momentum(self) -> None:
+        """Stage every weight's next momentum from its current gradient, writing no state.
+
+        Speculative clipping: called before the grad norm is known, on the unclipped
+        gradients. The staging is valid only if the clip then leaves them bitwise unchanged,
+        which the caller reports through :meth:`resolve_speculation`.
+        """
+        self._staged_momentum = {}
+        # l2 weight decay rewrites the gradient inside step(); the fallback steps in the parent.
+        if not self._homes_set or self.weight_decay_method == "l2":
+            return
+        for group in self.param_groups:
+            self._init_group(group)
+            for p in group["params"]:
+                if p.grad is not None:
+                    buf = self.state[p]["momentum_buffer"]
+                    self._staged_momentum[p] = buf.lerp(p.grad, 1 - group["momentum"])
+
+    def resolve_speculation(self, commit: bool) -> None:
+        """Hand the staged momentum to the next :meth:`step` (``commit``) or drop it."""
+        self._committed_momentum = self._staged_momentum if commit else {}
+        self._staged_momentum = {}
 
     def _apply_update(self, p: torch.Tensor, update: torch.Tensor, lr: float) -> None:
         """Apply one weight update through the base-class hook points.
@@ -753,7 +781,11 @@ class LayerShardedMuon(TensorParallelMuon):
                     grad = p.grad
                     state = self.state[p]
                     self._apply_weight_decay_inplace(p, grad, lr, group["weight_decay"])
-                    state["momentum_buffer"].lerp_(grad, 1 - beta)
+                    staged = self._committed_momentum.pop(p, None)
+                    if staged is None:
+                        state["momentum_buffer"].lerp_(grad, 1 - beta)
+                    else:  # same kernel and operands as the lerp_ above, computed early
+                        state["momentum_buffer"] = staged
 
             def ns_input(p):
                 """NS input of ``p``. With nesterov=False it aliases the momentum buffer
